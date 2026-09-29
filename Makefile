@@ -521,6 +521,9 @@ container-build-and-push-community: container-build-community container-push ## 
 cluster-functest: ginkgo ## Run e2e tests in a real cluster
 	./hack/functest.sh $(GINKGO_VERSION)
 
+.PHONY: test-e2e
+test-e2e: cluster-functest ## Standardized e2e test target alias
+
 # Shared dev environment
 # Uses a local sibling checkout if available (e.g. ../tools),
 # otherwise downloads the tools repo into .tools/ on first dev-* target use.

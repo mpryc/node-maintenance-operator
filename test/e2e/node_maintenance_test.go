@@ -1,501 +1,185 @@
+// Copyright 2018 The Operator-SDK Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package e2e
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"reflect"
-	"strings"
-	"time"
+	"os"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2/reporters"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
-	coordv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/utils/ptr"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	nmo "github.com/medik8s/node-maintenance-operator/api/v1beta1"
-	nodemaintenance "github.com/medik8s/node-maintenance-operator/internal/controller"
-	"github.com/medik8s/node-maintenance-operator/pkg/utils"
+	"github.com/medik8s/node-maintenance-operator/api/v1beta1"
 )
 
 const (
-	maintenanceKind       = "NodeMaintenance"
-	testWorkerMaintenance = "test-maintenance"
-	retryInterval         = time.Second * 5
-	eventInterval         = time.Second * 10
-	deploymentTimeout     = time.Second * 120
-	eventsTimeout         = time.Second * 180
-	testDeployment        = "test-deployment"
+	junitDir = "/tmp/artifacts"
 )
 
-var podLabel = map[string]string{"test": "drain"}
+var (
+	// The ns the operator is running in
+	operatorNsName string
+	// The ns for test deployments
+	testNsName    string
+	testNamespace *corev1.Namespace
+	// namespace leases are created in
+	leaseNs = "medik8s-leases"
+)
 
-var _ = Describe("Starting Maintenance", func() {
+var _ = BeforeSuite(func() {
+	operatorNsName = os.Getenv("OPERATOR_NS")
+	Expect(operatorNsName).ToNot(BeEmpty(), "OPERATOR_NS env var not set, can't start e2e test")
 
-	var (
-		controlPlaneNodes, workers []string
-		objectName                 string
-		controPlaneMaintenance     *nmo.NodeMaintenance
-	)
+	testNsName = os.Getenv("TEST_NAMESPACE")
+	Expect(testNsName).ToNot(BeEmpty(), "TEST_NAMESPACE env var not set, can't start e2e test")
+	testNamespace = &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testNsName,
+		},
+	}
 
-	BeforeEach(func() {
-		if controlPlaneNodes == nil {
-			// do this once only
-			controlPlaneNodes, workers = getNodes()
-			Expect(controlPlaneNodes).ToNot(BeEmpty(), "No master/control-plane nodes found")
-			Expect(workers).ToNot(BeEmpty(), "No worker nodes found")
-		}
-	})
+	// create test namespace
+	err := Client.Create(context.TODO(), testNamespace)
+	if errors.IsAlreadyExists(err) {
+		logWarnln("test namespace already exists, that is unexpected")
+	} else {
+		Expect(err).ToNot(HaveOccurred())
+	}
 
-	Context("for the 1st master/control-plane node", func() {
+	// On non-OpenShift clusters (e.g. Kind), provision mock etcd guard DaemonSet & PDB
+	// so the validating webhook can test etcd quorum protection logic without skipping.
+	ns := &corev1.Namespace{}
+	if err := Client.Get(context.TODO(), client.ObjectKey{Name: "openshift-etcd"}, ns); errors.IsNotFound(err) {
+		logInfoln("Non-OpenShift cluster detected: provisioning mock etcd-guard DaemonSet & PDB for master quorum tests")
+		ensureMockEtcdGuard(context.TODO())
+	}
 
-		var (
-			controlPlaneNode string
-			err              error
-		)
-
-		JustBeforeEach(func() {
-			if controPlaneMaintenance == nil {
-				// do this once only
-				controlPlaneNode = controlPlaneNodes[0]
-				objectName = fmt.Sprintf("test-1st-control-plane-%s", controlPlaneNode)
-				controPlaneMaintenance = getNodeMaintenance(objectName, controlPlaneNode)
-				err = createCRIgnoreUnrelatedErrors(controPlaneMaintenance)
-			}
-		})
-
-		It("should succeed", func() {
-			if len(controlPlaneNodes) < 3 {
-				Skip("cluster has less than 3 master/control-plane nodes and is to small for running this test")
-			}
-			Expect(err).ToNot(HaveOccurred())
-			verifyEvent(context.Background(), utils.EventReasonBeginMaintenance, objectName)
-		})
-
-		It("should fail", func() {
-			if len(controlPlaneNodes) >= 3 {
-				Skip("with 3 or more master/control-plane it should not fail")
-			}
-			// we have 1 control-plane node only
-			// on Openshift the etcd-quorum-guard PDB should prevent setting maintenance
-			// on k8s the fake etcd-quorum-guard PDB should do as well
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("can not put master/control-plane node into maintenance"), "Unexpected error message")
-			verifyNoEvent(context.Background(), utils.EventReasonBeginMaintenance, objectName)
-		})
-	})
-
-	Context("for the 2nd master/control-plane node", func() {
-
-		AfterEach(func() {
-			// after testing 2nd control-plane node we can restore 1st control-plane node
-			if controPlaneMaintenance != nil {
-				if err := Client.Delete(context.TODO(), controPlaneMaintenance); err != nil {
-					logWarnf("failed to delete NodeMaintenance for 1st master/control-plane node: %v\n", err)
-				}
-				controPlaneMaintenance = nil
-			}
-		})
-
-		It("should fail", func() {
-			if len(controlPlaneNodes) < 3 {
-				Skip("cluster has less than 3 master/control-plane nodes and is too small for running this test")
-			}
-			if len(controlPlaneNodes) > 3 {
-				logWarnf("there are %v master/control-plane nodes, which is unexpected. Skipping quorum validation for 2nd master/control-plane node!\n", len(controlPlaneNodes))
-				Skip("unexpected big cluster, no clue if 2nd master/control-plane maintenance is fine or not")
-			}
-
-			// the etcd-quorum-guard PDB needs some time to be updated after the 1st control-plane node was set into maintenance
-			time.Sleep(10 * time.Second)
-
-			controlPlaneNode := controlPlaneNodes[1]
-			objectName = fmt.Sprintf("test-2nd-control-plane-%s", controlPlaneNode)
-			nodeMaintenance := getNodeMaintenance(objectName, controlPlaneNode)
-
-			err := createCRIgnoreUnrelatedErrors(nodeMaintenance)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("can not put master/control-plane node into maintenance"), "Unexpected error message")
-			verifyNoEvent(context.Background(), utils.EventReasonBeginMaintenance, objectName)
-		})
-	})
-
-	Context("for a not existing node", func() {
-		It("should fail", func() {
-			nodeName := "doesNotExist"
-			objectName = "test-unexisting"
-			nodeMaintenance := getNodeMaintenance(objectName, nodeName)
-			err := createCRIgnoreUnrelatedErrors(nodeMaintenance)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring(fmt.Sprintf("no node with name %s found", nodeName)), "Unexpected error message")
-			verifyNoEvent(context.Background(), utils.EventReasonBeginMaintenance, objectName)
-		})
-	})
-
-	Context("for a worker node", func() {
-
-		var (
-			maintenanceNodeName string
-			nodeMaintenance     *nmo.NodeMaintenance
-			startTime           time.Time
-		)
-
-		BeforeEach(func() {
-			startTime = time.Now()
-			createTestDeployment()
-			maintenanceNodeName = getTestDeploymentNodeName()
-			nodeMaintenance = getNodeMaintenance(testWorkerMaintenance, maintenanceNodeName)
-		})
-		It("shoud put the node under maintenance", func() {
-			By("nm maintenance CR creation")
-			Expect(createCRIgnoreUnrelatedErrors(nodeMaintenance)).To(Succeed())
-
-			By("Preventing the creation of another maintenance CR for the same node")
-			nmDuplicate := getNodeMaintenance("test-duplicate", maintenanceNodeName)
-			err := createCRIgnoreUnrelatedErrors(nmDuplicate)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring(fmt.Sprintf("a NodeMaintenance for node %s already exists", maintenanceNodeName)), "Unexpected error message")
-
-			By("Preventing the update of node name")
-			nmCopy := nodeMaintenance.DeepCopy()
-			nmCopy.Spec.NodeName = "some-random-nodename"
-			err = Client.Patch(context.TODO(), nmCopy, client.MergeFrom(nodeMaintenance), &client.PatchOptions{})
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("updating spec.NodeName isn't allowed"), "Unexpected error message")
-
-			verifyEvent(context.Background(), utils.EventReasonBeginMaintenance, testWorkerMaintenance)
-			verifyEvent(context.Background(), utils.EventReasonSucceedMaintenance, testWorkerMaintenance)
-
-			// check operator log showing it reconciled with fixed duration because of drain timeout
-			// it should be caused by the test deployment's termination graceperiod > drain timeout
-			Expect(getOperatorLogs()).To(ContainSubstring(nodemaintenance.FixedDurationReconcileLog))
-
-			By("node should be unschedulable and tainted node")
-			node := &corev1.Node{}
-			err = Client.Get(context.TODO(), types.NamespacedName{Namespace: "", Name: maintenanceNodeName}, node)
-			Expect(err).ToNot(HaveOccurred(), "failed to get node")
-			Expect(node.Spec.Unschedulable).To(BeTrue(), "node should have been unschedulable")
-			Expect(isTainted(node)).To(BeTrue(), "node should have had the medik8s taint")
-
-			hasValidLease(maintenanceNodeName, startTime)
-
-			By("verify test workload moved to another worker node")
-			if len(workers) < 2 {
-				Skip("this doesn't work with 1 worker node only")
-			}
-			waitForTestDeployment(1)
-			nodeName := getTestDeploymentNodeName()
-			Expect(nodeName).NotTo(Equal(maintenanceNodeName), "workload should run on a new node now")
-
-			By("nm maintenance CR deletion")
-			Expect(Client.Delete(context.TODO(), nodeMaintenance)).To(Succeed(), "failed to delete node maintenance")
-
-			By("node status should be resetted after CR deletion")
-			Eventually(func() (bool, error) {
-				node := &corev1.Node{}
-				if err := Client.Get(context.TODO(), types.NamespacedName{Namespace: "", Name: maintenanceNodeName}, node); err != nil {
-					return false, err
-				}
-				if node.Spec.Unschedulable {
-					logInfoln("node is still unschedulable")
-					return false, nil
-				}
-				if isTainted(node) {
-					logInfoln("node is still tainted")
-					return false, nil
-				}
-				return true, nil
-			}, 60*time.Second, 10*time.Second).Should(BeTrue(), "node should be resetted")
-
-			verifyEvent(context.Background(), utils.EventReasonRemovedMaintenance, testWorkerMaintenance)
-
-			By("verify lease was invalidated and there is at least one available replica")
-			isLeaseInvalidated(maintenanceNodeName)
-			waitForTestDeployment(1)
-
-		})
-	})
+	// wait until webhooks are up and running by trying to create a CR and ignoring unexpected errors
+	testCR := getNodeMaintenance("webhook-test", "some-not-existing-node-name")
+	_ = createCRIgnoreUnrelatedErrors(testCR)
 })
 
-func getNodes() ([]string, []string) {
-	controlPlaneNodes := make([]string, 0)
-	workers := make([]string, 0)
-
-	nodesList := &corev1.NodeList{}
-	err := Client.List(context.TODO(), nodesList, &client.ListOptions{})
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "Couldn't get node names")
-
-	for _, node := range nodesList.Items {
-		if node.Labels == nil {
-			logWarnf("node %s has no role label, skipping it\n", node.Name)
-			continue
-		}
-		if _, exists := node.Labels["node-role.kubernetes.io/master"]; exists {
-			controlPlaneNodes = append(controlPlaneNodes, node.Name)
-		} else if _, exists := node.Labels["node-role.kubernetes.io/control-plane"]; exists {
-			controlPlaneNodes = append(controlPlaneNodes, node.Name)
-		} else {
-			workers = append(workers, node.Name)
-		}
+var _ = AfterSuite(func() {
+	// Delete nodeMaintenances
+	if err := Client.DeleteAllOf(context.TODO(), &v1beta1.NodeMaintenance{}); err != nil {
+		logWarnf("failed to clean up node maintenances: %v", err)
 	}
-	logInfof("master/control-plane nodes: %v\n", controlPlaneNodes)
-	logInfof("worker nodes: %v\n", workers)
-	return controlPlaneNodes, workers
+
+	// Delete test namespace
+	if err := Client.Delete(context.TODO(), testNamespace); err != nil {
+		logWarnf("failed to clean up test namespace: %v", err)
+	}
+
+	// Clean up mock etcd-guard namespace if present
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "openshift-etcd"}}
+	if err := Client.Delete(context.TODO(), ns); err != nil && !errors.IsNotFound(err) {
+		logWarnf("failed to clean up openshift-etcd namespace: %v", err)
+	}
+})
+
+func TestNodeMaintenance(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "Node Maintenance Operator e2e tests")
 }
 
-func getNodeMaintenance(name, nodeName string) *nmo.NodeMaintenance {
-	return &nmo.NodeMaintenance{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       maintenanceKind,
-			APIVersion: "nodemaintenance.medik8s.io/v1beta1",
-		},
+// NewJUnitReporter with the given name. testSuiteName must be a valid filename part
+func NewJUnitReporter(testSuiteName string) *reporters.JUnitReporter {
+	return reporters.NewJUnitReporter(fmt.Sprintf("%s/%s_%s.xml", junitDir, "unit_report", testSuiteName))
+}
+
+func ensureMockEtcdGuard(ctx context.Context) {
+	// 1. Create openshift-etcd namespace
+	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-		},
-		Spec: nmo.NodeMaintenanceSpec{
-			NodeName: nodeName,
-			Reason:   "Set maintenance on node for e2e testing",
+			Name: "openshift-etcd",
 		},
 	}
-}
+	if err := Client.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
+		logWarnf("failed to create openshift-etcd namespace for etcd guard mock: %v", err)
+	}
 
-// Ignore errors like
-// - connect: connection refused
-// - no endpoints available for service "node-maintenance-operator-service"
-// They can be caused by webhooks not being ready yet or unavailable control-plane nodes
-func createCRIgnoreUnrelatedErrors(nm *nmo.NodeMaintenance) error {
-	var err error
-
-	Eventually(func() string {
-		if err = Client.Create(context.TODO(), nm); err != nil {
-			logInfof("CR creation failed with error: %v\n", err)
-			return err.Error()
-		}
-		return ""
-	}, 60*time.Second, 5*time.Second).ShouldNot(Or(
-		ContainSubstring("connect"),
-		ContainSubstring("no endpoints available"),
-	), "webhook isn't working")
-
-	return err
-}
-
-func createTestDeployment() {
-	dep := &appsv1.Deployment{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "apps/v1",
-			Kind:       "Deployment",
-		},
+	// 2. Create etcd-guard DaemonSet targeting control-plane nodes
+	ds := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      testDeployment,
-			Namespace: testNsName,
+			Name:      "etcd-guard",
+			Namespace: "openshift-etcd",
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To[int32](1),
+		Spec: appsv1.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
-				MatchLabels: podLabel,
+				MatchLabels: map[string]string{"app": "etcd-guard"},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Namespace: testNsName,
-					Labels:    podLabel,
+					Labels: map[string]string{"app": "etcd-guard"},
 				},
 				Spec: corev1.PodSpec{
-					Affinity: &corev1.Affinity{
-						NodeAffinity: &corev1.NodeAffinity{
-							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-								NodeSelectorTerms: []corev1.NodeSelectorTerm{
-									{
-										MatchExpressions: []corev1.NodeSelectorRequirement{
-											{
-												Key:      "node-role.kubernetes.io/master",
-												Operator: corev1.NodeSelectorOpDoesNotExist,
-											},
-										},
-									},
-									{
-										MatchExpressions: []corev1.NodeSelectorRequirement{
-											{
-												Key:      "node-role.kubernetes.io/control-plane",
-												Operator: corev1.NodeSelectorOpDoesNotExist,
-											},
-										},
-									},
-								},
-							},
+					NodeSelector: map[string]string{
+						"node-role.kubernetes.io/control-plane": "",
+					},
+					Containers: []corev1.Container{
+						{
+							Name:  "pause",
+							Image: "registry.k8s.io/pause:3.9",
 						},
 					},
-					Containers: []corev1.Container{{
-						Image:   "busybox",
-						Name:    "testpodbusybox",
-						Command: []string{"/bin/sh"},
-						Args:    []string{"-c", "while true; do echo hello; sleep 10;done"},
-					}},
-					// make sure we run into the drain timeout at least once
-					TerminationGracePeriodSeconds: ptr.To[int64](int64(nodemaintenance.DrainerTimeout.Seconds()) + 50),
+					Tolerations: []corev1.Toleration{
+						{
+							Key:      "node-role.kubernetes.io/control-plane",
+							Operator: corev1.TolerationOpExists,
+							Effect:   corev1.TaintEffectNoSchedule,
+						},
+						{
+							Key:      "node-role.kubernetes.io/master",
+							Operator: corev1.TolerationOpExists,
+							Effect:   corev1.TaintEffectNoSchedule,
+						},
+					},
 				},
 			},
 		},
 	}
-
-	err := Client.Create(context.TODO(), dep)
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "failed to create test deployment")
-	waitForTestDeployment(2)
-}
-
-// waitForTestDeployment verifies whether the test deployment exists with a replica >=1
-// offset is used as the offset of EventuallyWithOffset function that verifies the test deployment existance
-func waitForTestDeployment(offset int) {
-
-	EventuallyWithOffset(offset, func() error {
-		deployment, err := KubeClient.AppsV1().Deployments(testNsName).Get(context.TODO(), testDeployment, metav1.GetOptions{})
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				logInfoln("test deployment not found yet")
-				return err
-			}
-			logInfof("unexpected error while waiting for test deployment: %v", err)
-			return err
-		}
-
-		if int(deployment.Status.AvailableReplicas) >= 1 {
-			return nil
-		}
-		logInfoln("test deployment not available yet")
-		return fmt.Errorf("test deploymemt not ready yet")
-
-	}, deploymentTimeout, retryInterval).ShouldNot(HaveOccurred(), "test deployment failed")
-
-}
-
-func getTestDeploymentNodeName() string {
-	pods := getTestDeploymentPods()
-	ExpectWithOffset(2, len(pods.Items)).ToNot(BeZero(), "no operator pod found")
-	nodeName := pods.Items[0].Spec.NodeName
-	return nodeName
-}
-
-func getTestDeploymentPods() *corev1.PodList {
-	labelSelector := labels.SelectorFromSet(podLabel)
-	pods := &corev1.PodList{}
-	err := Client.List(context.TODO(), pods, &client.ListOptions{LabelSelector: labelSelector})
-	ExpectWithOffset(2, err).ToNot(HaveOccurred(), "failed to get test pods")
-	ExpectWithOffset(2, pods.Size()).ToNot(BeZero(), "no test pods found")
-	return pods
-}
-
-func getOperatorLogs() string {
-	pod := getOperatorPod()
-	podName := pod.ObjectMeta.Name
-	podLogOpts := corev1.PodLogOptions{
-		Container: "manager",
+	if err := Client.Create(ctx, ds); err != nil && !errors.IsAlreadyExists(err) {
+		logWarnf("failed to create etcd-guard DaemonSet for mock: %v", err)
 	}
 
-	req := KubeClient.CoreV1().Pods(pod.Namespace).GetLogs(podName, &podLogOpts)
-	podLogs, err := req.Stream(context.Background())
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "failed to stream operator logs")
-	defer podLogs.Close()
-
-	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, podLogs)
-	ExpectWithOffset(1, err).ToNot(HaveOccurred(), "failed to copy operator logs")
-	return buf.String()
-}
-
-func getOperatorPod() *corev1.Pod {
-	pods, err := KubeClient.CoreV1().Pods(operatorNsName).List(context.Background(), metav1.ListOptions{LabelSelector: "node-maintenance-operator="})
-	ExpectWithOffset(2, err).ToNot(HaveOccurred(), "failed to get operator pods")
-	ExpectWithOffset(2, len(pods.Items)).ToNot(BeZero(), "no operator pod found")
-	return &pods.Items[0]
-}
-
-func isTainted(node *corev1.Node) bool {
-	medik8sDrainTaint := corev1.Taint{
-		Key:    "medik8s.io/drain",
-		Effect: corev1.TaintEffectNoSchedule,
+	// 3. Create etcd-guard-pdb with maxUnavailable = 1
+	maxUnavailable := intstr.FromInt32(1)
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "etcd-guard-pdb",
+			Namespace: "openshift-etcd",
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &maxUnavailable,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "etcd-guard"},
+			},
+		},
 	}
-	taints := node.Spec.Taints
-	for _, taint := range taints {
-		if reflect.DeepEqual(taint, medik8sDrainTaint) {
-			return true
-		}
+	if err := Client.Create(ctx, pdb); err != nil && !errors.IsAlreadyExists(err) {
+		logWarnf("failed to create etcd-guard-pdb for etcd guard mock: %v", err)
 	}
-	return false
-}
-
-func hasValidLease(nodeName string, startTime time.Time) {
-	Eventually(func(g Gomega) {
-		lease := &coordv1.Lease{}
-		err := Client.Get(context.TODO(), types.NamespacedName{Namespace: leaseNs, Name: fmt.Sprintf("node-%s", nodeName)}, lease)
-		g.ExpectWithOffset(1, err).ToNot(HaveOccurred(), "failed to get lease")
-
-		g.ExpectWithOffset(1, *lease.Spec.LeaseDurationSeconds).To(Equal(int32(nodemaintenance.LeaseDuration.Seconds())))
-		g.ExpectWithOffset(1, *lease.Spec.HolderIdentity).To(Equal(nodemaintenance.LeaseHolderIdentity))
-
-		// renew and aquire time should be between maintenance start and now
-		checkTime := time.Now()
-		g.ExpectWithOffset(1, lease.Spec.AcquireTime.Time).To(BeTemporally(">", startTime), "acquire time should be after start time")
-		g.ExpectWithOffset(1, lease.Spec.AcquireTime.Time).To(BeTemporally("<", checkTime), "acquire time should be before now")
-		g.ExpectWithOffset(1, lease.Spec.RenewTime.Time).To(BeTemporally(">", startTime), "renew time should be after start time")
-		g.ExpectWithOffset(1, lease.Spec.RenewTime.Time).To(BeTemporally("<", checkTime), "renew time should be before now")
-
-		// renewal checks would take too long, lease time is 1 hour...})
-
-	}, 60*time.Second, 5*time.Second).Should(Succeed())
-}
-
-func isLeaseInvalidated(nodeName string) {
-	lease := &coordv1.Lease{}
-	err := Client.Get(context.TODO(), types.NamespacedName{Namespace: leaseNs, Name: fmt.Sprintf("node-%s", nodeName)}, lease)
-	Expect(apierrors.IsNotFound(err)).To(BeTrue())
-}
-
-// waitForEvent polls the filtered events and returns an error if it could not find the desired event
-// by its name and reason
-func waitForEvent(ctx context.Context, eventReason, eventIdentifier string) error {
-	// Wait for events with a timeout
-	return wait.PollUntilContextTimeout(ctx, retryInterval, eventsTimeout, true, func(ctx context.Context) (bool, error) {
-		events, err := KubeClient.CoreV1().Events("").List(ctx, metav1.ListOptions{
-			FieldSelector: fmt.Sprintf("involvedObject.kind=%s", maintenanceKind),
-		})
-		if err != nil {
-			return false, fmt.Errorf("Error listing events: %v", err)
-		}
-
-		// go over all nm CR events, and find an event that match the event reason and contains the desired name identifier
-		for _, event := range events.Items {
-			if strings.Contains(event.Name, eventIdentifier) && event.Reason == eventReason {
-				return true, nil
-			}
-		}
-		return false, nil
-	})
-}
-
-// verifyEvent expects to find an event based on its reason and the identifier
-func verifyEvent(ctx context.Context, eventReason, eventIdentifier string) {
-	By(fmt.Sprintf("Verifying that event %s was created for %s nm CR", eventReason, eventIdentifier))
-	err := waitForEvent(ctx, eventReason, eventIdentifier)
-	if err != nil {
-		fmt.Printf("Error waiting for events: %v", err)
-	}
-	Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Event %s was missing for %s nm CR", eventReason, eventIdentifier))
-}
-
-// verifyNoEvent expects to fail on finding an event based on its reason and the identifier
-func verifyNoEvent(ctx context.Context, eventReason, eventIdentifier string) {
-	By(fmt.Sprintf("Verifying that event %s was not created for %s nm CR", eventReason, eventIdentifier))
-	// check error as indication of missing event
-	Expect(waitForEvent(ctx, eventReason, eventIdentifier)).To(HaveOccurred(),
-		fmt.Sprintf("Event %s existed for %s nm CR", eventReason, eventIdentifier))
 }
